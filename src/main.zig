@@ -94,7 +94,7 @@ fn discoverNodesWithNamespaces(allocator: std.mem.Allocator, node: *c.rcl_node_t
 
     const alloc = c.rcutils_get_default_allocator();
 
-    // Get node names and namespaces
+    // Get node names and namespaces - correct function name
     const ret = c.rcl_get_node_names(
         node,
         alloc,
@@ -124,7 +124,7 @@ fn discoverTopics(allocator: std.mem.Allocator, node: *c.rcl_node_t) !void {
     var topic_names_and_types = c.rcl_get_zero_initialized_names_and_types();
     defer _ = c.rcl_names_and_types_fini(&topic_names_and_types);
 
-    const alloc = c.rcutils_get_default_allocator();
+    var alloc = c.rcutils_get_default_allocator();
     const ret = c.rcl_get_topic_names_and_types(
         node,
         &alloc,
@@ -170,7 +170,7 @@ fn discoverServices(allocator: std.mem.Allocator, node: *c.rcl_node_t) !void {
     var service_names_and_types = c.rcl_get_zero_initialized_names_and_types();
     defer _ = c.rcl_names_and_types_fini(&service_names_and_types);
 
-    const alloc = c.rcutils_get_default_allocator();
+    var alloc = c.rcutils_get_default_allocator();
     const ret = c.rcl_get_service_names_and_types(node, &alloc, &service_names_and_types);
 
     if (ret != c.RCL_RET_OK) {
@@ -249,7 +249,7 @@ fn isUnknown(type_name: []const u8) bool {
 fn getPublishersAndSubscribers(allocator: std.mem.Allocator, node: *c.rcl_node_t, topic_name: [*c]const u8) !void {
     _ = allocator;
 
-    const alloc = c.rcutils_get_default_allocator();
+    var alloc = c.rcutils_get_default_allocator();
 
     // Get publishers
     var pub_info = c.rcl_get_zero_initialized_topic_endpoint_info_array();
