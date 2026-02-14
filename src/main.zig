@@ -3,7 +3,52 @@ const c = @cImport({
     @cInclude("rcl/rcl.h");
     @cInclude("rcl/graph.h");
     @cInclude("rmw/rmw.h");
+    @cInclude("rosidl_typesupport_introspection_c/message_introspection.h");
+    @cInclude("rosidl_runtime_c/message_type_support_struct.h");
+    @cInclude("dlfcn.h");
 });
+
+const JsonOutput = struct {
+    topics: []TopicInfo,
+    nodes: []NodeInfo,
+    services: []ServiceInfo,
+    rmw_implementation: []const u8,
+
+    const TopicInfo = struct {
+        name: []const u8,
+        type_name: []const u8,
+        schema: ?MessageSchema,
+        publishers: []EndpointInfo,
+        subscribers: []EndpointInfo,
+    };
+
+    const NodeInfo = struct {
+        name: []const u8,
+        namespace: []const u8,
+    };
+
+    const ServiceInfo = struct {
+        name: []const u8,
+        type_name: []const u8,
+    };
+
+    const EndpointInfo = struct {
+        node_name: []const u8,
+        node_namespace: []const u8,
+    };
+
+    const MessageSchema = struct {
+        fields: []FieldInfo,
+    };
+
+    const FieldInfo = struct {
+        name: []const u8,
+        type_name: []const u8,
+        is_array: bool,
+        array_size: usize,
+        is_upper_bound: bool,
+    };
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -49,42 +94,44 @@ pub fn main() !void {
     std.debug.print("Waiting for DDS discovery...\n", .{});
     std.Thread.sleep(2 * std.time.ns_per_s);
 
-    // Discovery loop
-    var count: usize = 0;
-    while (count < 10) : (count += 1) {
-        std.Thread.sleep(5 * std.time.ns_per_s);
+    // Discover network and export to JSON
+    const json_output = try discoverNetworkToJson(allocator, &node);
+    defer freeJsonOutput(allocator, json_output);
 
-        try discoverNetwork(allocator, &node);
-    }
+    var string: std.io.Writer.Allocating = .init(allocator);
+    defer string.deinit();
+
+    try string.writer.print("{f}", .{std.json.fmt(json_output, .{ .whitespace = .indent_2 })});
+
+    const json_string = string.written();
+
+    const file = try std.fs.cwd().createFile("ros2_discovery.json", .{});
+    defer file.close();
+    try file.writeAll(json_string);
+    std.debug.print("\nWritten to ros2_discovery.json\n", .{});
 }
 
-fn discoverNetwork(allocator: std.mem.Allocator, node: *c.rcl_node_t) !void {
-    std.debug.print("\n", .{});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("ROS2 NETWORK DISCOVERY (Zig)\n", .{});
-    std.debug.print("================================================================================\n", .{});
+fn discoverNetworkToJson(allocator: std.mem.Allocator, node: *c.rcl_node_t) !JsonOutput {
+    const rmw_impl = c.rmw_get_implementation_identifier();
 
-    // Print RMW implementation
-    try printRmwInfo();
-
-    // Discover nodes with their namespaces
-    try discoverNodesWithNamespaces(allocator, node);
+    // Discover nodes
+    const nodes = try discoverNodes(allocator, node);
 
     // Discover topics
-    try discoverTopics(allocator, node);
+    const topics = try discoverTopicsWithSchemas(allocator, node);
 
     // Discover services
-    try discoverServices(allocator, node);
+    const services = try discoverServicesInfo(allocator, node);
+
+    return JsonOutput{
+        .rmw_implementation = std.mem.span(rmw_impl),
+        .nodes = nodes,
+        .topics = topics,
+        .services = services,
+    };
 }
 
-fn printRmwInfo() !void {
-    const rmw_impl = c.rmw_get_implementation_identifier();
-    std.debug.print("\nRMW Implementation: {s}\n", .{rmw_impl});
-}
-
-fn discoverNodesWithNamespaces(allocator: std.mem.Allocator, node: *c.rcl_node_t) !void {
-    _ = allocator;
-
+fn discoverNodes(allocator: std.mem.Allocator, node: *c.rcl_node_t) ![]JsonOutput.NodeInfo {
     var node_names = c.rcutils_get_zero_initialized_string_array();
     var node_namespaces = c.rcutils_get_zero_initialized_string_array();
     defer {
@@ -93,185 +140,85 @@ fn discoverNodesWithNamespaces(allocator: std.mem.Allocator, node: *c.rcl_node_t
     }
 
     const alloc = c.rcutils_get_default_allocator();
-
-    // Get node names and namespaces - correct function name
-    const ret = c.rcl_get_node_names(
-        node,
-        alloc,
-        &node_names,
-        &node_namespaces,
-    );
+    const ret = c.rcl_get_node_names(node, alloc, &node_names, &node_namespaces);
 
     if (ret != c.RCL_RET_OK) {
-        std.debug.print("Failed to get node names\n", .{});
-        return;
+        return error.FailedToGetNodes;
     }
 
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("Discovered {} nodes:\n", .{node_names.size});
-    std.debug.print("================================================================================\n", .{});
+    var nodes = try allocator.alloc(JsonOutput.NodeInfo, node_names.size);
 
     var i: usize = 0;
     while (i < node_names.size) : (i += 1) {
-        const name = node_names.data[i];
-        const namespace = node_namespaces.data[i];
-        std.debug.print("  - {s}{s}\n", .{ namespace, name });
+        nodes[i] = .{
+            .name = try allocator.dupe(u8, std.mem.span(node_names.data[i])),
+            .namespace = try allocator.dupe(u8, std.mem.span(node_namespaces.data[i])),
+        };
     }
-    std.debug.print("\n", .{});
+
+    return nodes;
 }
 
-fn discoverTopics(allocator: std.mem.Allocator, node: *c.rcl_node_t) !void {
+fn discoverTopicsWithSchemas(allocator: std.mem.Allocator, node: *c.rcl_node_t) ![]JsonOutput.TopicInfo {
     var topic_names_and_types = c.rcl_get_zero_initialized_names_and_types();
     defer _ = c.rcl_names_and_types_fini(&topic_names_and_types);
 
     var alloc = c.rcutils_get_default_allocator();
-    const ret = c.rcl_get_topic_names_and_types(
-        node,
-        &alloc,
-        false, // no_demangle
-        &topic_names_and_types,
-    );
+    const ret = c.rcl_get_topic_names_and_types(node, &alloc, false, &topic_names_and_types);
 
     if (ret != c.RCL_RET_OK) {
-        std.debug.print("Failed to get topic names and types\n", .{});
-        return;
+        return error.FailedToGetTopics;
     }
 
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("Discovered {} topics:\n", .{topic_names_and_types.names.size});
-    std.debug.print("================================================================================\n\n", .{});
+    var topics = try allocator.alloc(JsonOutput.TopicInfo, topic_names_and_types.names.size);
 
     var i: usize = 0;
     while (i < topic_names_and_types.names.size) : (i += 1) {
         const topic_name = topic_names_and_types.names.data[i];
-        std.debug.print("Topic: {s}\n", .{topic_name});
-
-        // Get types for this topic
         const types = &topic_names_and_types.types[i];
-        var j: usize = 0;
-        while (j < types.size) : (j += 1) {
-            const type_name = types.data[j];
-            std.debug.print("  Type: {s}\n", .{type_name});
-
-            // Analyze the type
-            analyzeMessageType(type_name);
-        }
+        const type_name: [*:0]const u8 = if (types.size > 0) types.data[0] else "";
 
         // Get publishers and subscribers
-        try getPublishersAndSubscribers(allocator, node, topic_name);
+        const endpoints = try getTopicEndpoints(allocator, node, topic_name);
 
-        std.debug.print("\n", .{});
-    }
-}
+        // Introspect message schema
+        const schema = introspectMessageType(allocator, type_name) catch null;
 
-fn discoverServices(allocator: std.mem.Allocator, node: *c.rcl_node_t) !void {
-    _ = allocator;
-
-    var service_names_and_types = c.rcl_get_zero_initialized_names_and_types();
-    defer _ = c.rcl_names_and_types_fini(&service_names_and_types);
-
-    var alloc = c.rcutils_get_default_allocator();
-    const ret = c.rcl_get_service_names_and_types(node, &alloc, &service_names_and_types);
-
-    if (ret != c.RCL_RET_OK) {
-        std.debug.print("Failed to get service names and types\n", .{});
-        return;
+        topics[i] = .{
+            .name = try allocator.dupe(u8, std.mem.span(topic_name)),
+            .type_name = try allocator.dupe(u8, std.mem.span(type_name)),
+            .schema = schema,
+            .publishers = endpoints.publishers,
+            .subscribers = endpoints.subscribers,
+        };
     }
 
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("Discovered {} services:\n", .{service_names_and_types.names.size});
-    std.debug.print("================================================================================\n\n", .{});
-
-    var i: usize = 0;
-    while (i < service_names_and_types.names.size) : (i += 1) {
-        const service_name = service_names_and_types.names.data[i];
-        std.debug.print("Service: {s}\n", .{service_name});
-
-        // Get types for this service
-        const types = &service_names_and_types.types[i];
-        var j: usize = 0;
-        while (j < types.size) : (j += 1) {
-            const type_name = types.data[j];
-            std.debug.print("  Type: {s}\n", .{type_name});
-        }
-        std.debug.print("\n", .{});
-    }
+    return topics;
 }
 
-fn analyzeMessageType(type_name: [*c]const u8) void {
-    // Parse type name to determine if it's POD
-    // For this simplified version, we'll check against known primitive types
-    const type_str = std.mem.span(type_name);
+const TopicEndpoints = struct {
+    publishers: []JsonOutput.EndpointInfo,
+    subscribers: []JsonOutput.EndpointInfo,
+};
 
-    const is_pod = isPodType(type_str);
-    const has_nested = !is_pod and !isUnknown(type_str);
-
-    std.debug.print("    Is POD: {}\n", .{is_pod});
-    std.debug.print("    Has nested types: {}\n", .{has_nested});
-
-    // Note: Full introspection of message fields requires type support introspection
-    // which is more complex in C/Zig. For a complete implementation, you'd need to:
-    // 1. Load the type support library dynamically
-    // 2. Get the message type support structure
-    // 3. Introspect the fields using rosidl_typesupport_introspection_c
-    std.debug.print("    Field introspection: Requires rosidl_typesupport_introspection_c\n", .{});
-}
-
-fn isPodType(type_name: []const u8) bool {
-    // Common POD types in ROS2
-    const pod_types = [_][]const u8{
-        "std_msgs/msg/String",
-        "std_msgs/msg/Int32",
-        "std_msgs/msg/Int64",
-        "std_msgs/msg/UInt32",
-        "std_msgs/msg/UInt64",
-        "std_msgs/msg/Float32",
-        "std_msgs/msg/Float64",
-        "std_msgs/msg/Bool",
-        "std_msgs/msg/Byte",
-        "std_msgs/msg/Char",
-    };
-
-    for (pod_types) |pod_type| {
-        if (std.mem.eql(u8, type_name, pod_type)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-fn isUnknown(type_name: []const u8) bool {
-    _ = type_name;
-    return false;
-}
-
-fn getPublishersAndSubscribers(allocator: std.mem.Allocator, node: *c.rcl_node_t, topic_name: [*c]const u8) !void {
-    _ = allocator;
-
+fn getTopicEndpoints(allocator: std.mem.Allocator, node: *c.rcl_node_t, topic_name: [*c]const u8) !TopicEndpoints {
     var alloc = c.rcutils_get_default_allocator();
 
     // Get publishers
     var pub_info = c.rcl_get_zero_initialized_topic_endpoint_info_array();
     defer _ = c.rcl_topic_endpoint_info_array_fini(&pub_info, &alloc);
 
-    var ret = c.rcl_get_publishers_info_by_topic(
-        node,
-        &alloc,
-        topic_name,
-        false, // no_mangle
-        &pub_info,
-    );
-    if (ret == c.RCL_RET_OK) {
-        std.debug.print("  Publishers: {}\n", .{pub_info.size});
+    var ret = c.rcl_get_publishers_info_by_topic(node, &alloc, topic_name, false, &pub_info);
 
+    var publishers = try allocator.alloc(JsonOutput.EndpointInfo, if (ret == c.RCL_RET_OK) pub_info.size else 0);
+    if (ret == c.RCL_RET_OK) {
         var i: usize = 0;
         while (i < pub_info.size) : (i += 1) {
             const info = &pub_info.info_array[i];
-            std.debug.print("    - Node: {s}, Namespace: {s}\n", .{
-                info.node_name,
-                info.node_namespace,
-            });
+            publishers[i] = .{
+                .node_name = try allocator.dupe(u8, std.mem.span(info.node_name)),
+                .node_namespace = try allocator.dupe(u8, std.mem.span(info.node_namespace)),
+            };
         }
     }
 
@@ -279,23 +226,173 @@ fn getPublishersAndSubscribers(allocator: std.mem.Allocator, node: *c.rcl_node_t
     var sub_info = c.rcl_get_zero_initialized_topic_endpoint_info_array();
     defer _ = c.rcl_topic_endpoint_info_array_fini(&sub_info, &alloc);
 
-    ret = c.rcl_get_subscriptions_info_by_topic(
-        node,
-        &alloc,
-        topic_name,
-        false, // no_mangle
-        &sub_info,
-    );
-    if (ret == c.RCL_RET_OK) {
-        std.debug.print("  Subscribers: {}\n", .{sub_info.size});
+    ret = c.rcl_get_subscriptions_info_by_topic(node, &alloc, topic_name, false, &sub_info);
 
+    var subscribers = try allocator.alloc(JsonOutput.EndpointInfo, if (ret == c.RCL_RET_OK) sub_info.size else 0);
+    if (ret == c.RCL_RET_OK) {
         var i: usize = 0;
         while (i < sub_info.size) : (i += 1) {
             const info = &sub_info.info_array[i];
-            std.debug.print("    - Node: {s}, Namespace: {s}\n", .{
-                info.node_name,
-                info.node_namespace,
-            });
+            subscribers[i] = .{
+                .node_name = try allocator.dupe(u8, std.mem.span(info.node_name)),
+                .node_namespace = try allocator.dupe(u8, std.mem.span(info.node_namespace)),
+            };
         }
     }
+
+    return .{
+        .publishers = publishers,
+        .subscribers = subscribers,
+    };
+}
+
+fn introspectMessageType(allocator: std.mem.Allocator, type_name_cstr: [*c]const u8) !JsonOutput.MessageSchema {
+    const type_name = std.mem.span(type_name_cstr);
+
+    // Parse type name: "package_name/msg/MessageName" -> package_name, MessageName
+    var parts = std.mem.splitSequence(u8, type_name, "/");
+    const package_name = parts.next() orelse return error.InvalidTypeName;
+    _ = parts.next(); // Skip "msg"
+    const message_name = parts.next() orelse return error.InvalidTypeName;
+
+    // Build library name: libpackage_name__rosidl_typesupport_introspection_c.so
+    const lib_name = try std.fmt.allocPrint(allocator, "lib{s}__rosidl_typesupport_introspection_c.so", .{package_name});
+    defer allocator.free(lib_name);
+
+    // Load type support library
+    const handle = c.dlopen(lib_name.ptr, c.RTLD_LAZY);
+    if (handle == null) {
+        std.debug.print("Warning: Could not load type support for {s}: {s}\n", .{ type_name, c.dlerror() });
+        return error.TypeSupportNotFound;
+    }
+    defer _ = c.dlclose(handle);
+
+    // Get type support function: rosidl_typesupport_introspection_c__get_message_type_support_handle__package_name__msg__MessageName
+    const func_name = try std.fmt.allocPrint(
+        allocator,
+        "rosidl_typesupport_introspection_c__get_message_type_support_handle__{s}__msg__{s}",
+        .{ package_name, message_name },
+    );
+    defer allocator.free(func_name);
+
+    const func_name_z = try allocator.dupeZ(u8, func_name);
+    defer allocator.free(func_name_z);
+
+    const get_ts_func = c.dlsym(handle, func_name_z.ptr);
+    if (get_ts_func == null) {
+        std.debug.print("Warning: Could not find type support function: {s}\n", .{func_name});
+        return error.TypeSupportFunctionNotFound;
+    }
+
+    // Call the function to get type support
+    const GetTypeSupportFunc = *const fn () callconv(.c) ?*const c.rosidl_message_type_support_t;
+    const get_ts: GetTypeSupportFunc = @ptrCast(@alignCast(get_ts_func));
+    const type_support = get_ts() orelse return error.TypeSupportNull;
+
+    // Cast to introspection type support
+    const intro_ts: *const c.rosidl_typesupport_introspection_c__MessageMembers = @ptrCast(@alignCast(type_support.data));
+
+    // Extract field information
+    var fields = try allocator.alloc(JsonOutput.FieldInfo, intro_ts.member_count_);
+
+    var i: u32 = 0;
+    while (i < intro_ts.member_count_) : (i += 1) {
+        const member = intro_ts.members_ + i;
+        fields[i] = .{
+            .name = try allocator.dupe(u8, std.mem.span(member.*.name_)),
+            .type_name = try getFieldTypeName(member),
+            .is_array = member.*.is_array_,
+            .array_size = member.*.array_size_,
+            .is_upper_bound = member.*.is_upper_bound_,
+        };
+    }
+    return JsonOutput.MessageSchema{
+        .fields = fields,
+    };
+}
+
+fn getFieldTypeName(member: *const c.rosidl_typesupport_introspection_c__MessageMember) ![]const u8 {
+    return switch (member.type_id_) {
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_FLOAT => "float",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_DOUBLE => "double",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_LONG_DOUBLE => "long double",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_CHAR => "char",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_WCHAR => "wchar",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_BOOLEAN => "boolean",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_UINT8 => "uint8",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_INT8 => "int8",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_UINT16 => "uint16",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_INT16 => "int16",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_UINT32 => "uint32",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_INT32 => "int32",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_UINT64 => "uint64",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_INT64 => "int64",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_STRING => "string",
+        c.ROSIDL_DYNAMIC_TYPESUPPORT_FIELD_TYPE_WSTRING => "wstring",
+        else => "unknown",
+    };
+}
+
+fn discoverServicesInfo(allocator: std.mem.Allocator, node: *c.rcl_node_t) ![]JsonOutput.ServiceInfo {
+    var service_names_and_types = c.rcl_get_zero_initialized_names_and_types();
+    defer _ = c.rcl_names_and_types_fini(&service_names_and_types);
+
+    var alloc = c.rcutils_get_default_allocator();
+    const ret = c.rcl_get_service_names_and_types(node, &alloc, &service_names_and_types);
+
+    if (ret != c.RCL_RET_OK) {
+        return error.FailedToGetServices;
+    }
+
+    var services = try allocator.alloc(JsonOutput.ServiceInfo, service_names_and_types.names.size);
+
+    var i: usize = 0;
+    while (i < service_names_and_types.names.size) : (i += 1) {
+        const service_name = service_names_and_types.names.data[i];
+        const types = &service_names_and_types.types[i];
+        const type_name: [*:0]const u8 = if (types.size > 0) types.data[0] else "";
+
+        services[i] = .{
+            .name = try allocator.dupe(u8, std.mem.span(service_name)),
+            .type_name = try allocator.dupe(u8, std.mem.span(type_name)),
+        };
+    }
+
+    return services;
+}
+
+fn freeJsonOutput(allocator: std.mem.Allocator, output: JsonOutput) void {
+    for (output.nodes) |node_info| {
+        allocator.free(node_info.name);
+        allocator.free(node_info.namespace);
+    }
+    allocator.free(output.nodes);
+
+    for (output.topics) |topic| {
+        allocator.free(topic.name);
+        allocator.free(topic.type_name);
+        if (topic.schema) |schema| {
+            for (schema.fields) |field| {
+                allocator.free(field.name);
+            }
+            allocator.free(schema.fields);
+        }
+        for (topic.publishers) |publisher| {
+            allocator.free(publisher.node_name);
+            allocator.free(publisher.node_namespace);
+        }
+        allocator.free(topic.publishers);
+        for (topic.subscribers) |sub| {
+            allocator.free(sub.node_name);
+            allocator.free(sub.node_namespace);
+        }
+        allocator.free(topic.subscribers);
+    }
+    allocator.free(output.topics);
+
+    for (output.services) |service| {
+        allocator.free(service.name);
+        allocator.free(service.type_name);
+    }
+    allocator.free(output.services);
 }

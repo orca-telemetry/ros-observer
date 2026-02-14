@@ -35,9 +35,13 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/ros/jazzy/include/builtin_interfaces/" });
     exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/ros/jazzy/include/rosidl_typesupport_interface/" });
     exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/ros/jazzy/include/rosidl_dynamic_typesupport/" });
+    exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/ros/jazzy/include/rosidl_typesupport_introspection_c/" });
 
     // Add library search path
     exe.root_module.addLibraryPath(.{ .cwd_relative = "/opt/ros/jazzy/lib/" });
+
+    // Add rpath so the executable can find ROS2 libraries at runtime
+    exe.root_module.addRPath(.{ .cwd_relative = "/opt/ros/jazzy/lib/" });
 
     // Link against ROS2 libraries
     exe.linkSystemLibrary("rcl");
@@ -47,6 +51,8 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("rcl_yaml_param_parser");
     exe.linkSystemLibrary("rosidl_runtime_c");
     exe.linkSystemLibrary("rosidl_typesupport_c");
+    exe.linkSystemLibrary("rosidl_typesupport_introspection_c");
+    exe.linkSystemLibrary("dl"); // For dynamic loading
 
     b.installArtifact(exe);
 
