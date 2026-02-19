@@ -2,13 +2,12 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
 
     const mod = b.addModule("ros_observer", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
-
     const exe = b.addExecutable(.{
         .name = "ros_observer",
         .root_module = b.createModule(.{
@@ -20,6 +19,13 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    // strip all debug symbols (Crucial for size)
+    exe.root_module.strip = true;
+
+    // dead Code Elimination (Linker Garbage Collection)
+    // This removes functions that are never called.
+    exe.link_gc_sections = true;
 
     // Link libc
     exe.root_module.link_libc = true;
@@ -44,15 +50,15 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addRPath(.{ .cwd_relative = "/opt/ros/jazzy/lib/" });
 
     // Link against ROS2 libraries
-    exe.linkSystemLibrary("rcl");
-    exe.linkSystemLibrary("rcutils");
-    exe.linkSystemLibrary("rmw");
-    exe.linkSystemLibrary("rmw_implementation");
-    exe.linkSystemLibrary("rcl_yaml_param_parser");
-    exe.linkSystemLibrary("rosidl_runtime_c");
-    exe.linkSystemLibrary("rosidl_typesupport_c");
-    exe.linkSystemLibrary("rosidl_typesupport_introspection_c");
-    exe.linkSystemLibrary("dl"); // For dynamic loading
+    exe.root_module.linkSystemLibrary("rcl", .{});
+    exe.root_module.linkSystemLibrary("rcutils", .{});
+    exe.root_module.linkSystemLibrary("rmw", .{});
+    exe.root_module.linkSystemLibrary("rmw_implementation", .{});
+    exe.root_module.linkSystemLibrary("rcl_yaml_param_parser", .{});
+    exe.root_module.linkSystemLibrary("rosidl_runtime_c", .{});
+    exe.root_module.linkSystemLibrary("rosidl_typesupport_c", .{});
+    exe.root_module.linkSystemLibrary("rosidl_typesupport_introspection_c", .{});
+    exe.root_module.linkSystemLibrary("dl", .{}); // For dynamic loading
 
     b.installArtifact(exe);
 
