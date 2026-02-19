@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
 
     // Add include paths
     exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/ros/jazzy/include/rcl/" });
+    exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/ros/jazzy/include/rcl/rcl/" });
     exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/ros/jazzy/include/rcutils/" });
     exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/ros/jazzy/include/rmw/" });
     exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/ros/jazzy/include/rcl_yaml_param_parser/" });
