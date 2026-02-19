@@ -8,8 +8,8 @@ const JsonOutput = struct {
     nodes: []NodeInfo,
     services: []ServiceInfo,
     rmw_implementation: []const u8,
-    public_key: []const u8,
-    signature: []const u8,
+    public_key: []const u8 = "",
+    signature: []const u8 = "",
 
     const TopicInfo = struct {
         name: []const u8,
@@ -53,12 +53,12 @@ pub fn runDiscovery(allocator: std.mem.Allocator, node: *c.rcl_node_t) !void {
     defer freeJsonOutput(allocator, discovery_data);
 
     // 2. Initial stringify to create the signing bytes
-    var sign_target = std.ArrayList(u8).init(allocator);
+    var sign_target: std.Io.Writer.Allocating = .init(allocator);
     defer sign_target.deinit();
-    try std.json.stringify(discovery_data, .{}, sign_target.writer());
+    try sign_target.writer.print("{f}", .{std.json.fmt(discovery_data, .{})});
 
     // 3. Sign the bytes
-    const signature_hex = try keys.signData(allocator, sign_target.items);
+    const signature_hex = try keys.signData(allocator, sign_target.written());
     defer allocator.free(signature_hex);
 
     // 4. Get Public Key Hex for identification
@@ -75,7 +75,10 @@ pub fn runDiscovery(allocator: std.mem.Allocator, node: *c.rcl_node_t) !void {
     // Optional: Also save a local copy for debugging
     const file = try std.fs.cwd().createFile("last_discovery_sent.json", .{});
     defer file.close();
-    try std.json.stringify(discovery_data, .{ .whitespace = .indent_2 }, file.writer());
+    var debug_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer debug_writer.deinit();
+    try debug_writer.writer.print("{f}", .{std.json.fmt(discovery_data, .{})});
+    try file.writeAll(debug_writer.written());
 }
 
 fn discoverNetworkToJson(allocator: std.mem.Allocator, node: *c.rcl_node_t) !JsonOutput {
@@ -371,43 +374,39 @@ fn freeJsonOutput(allocator: std.mem.Allocator, output: JsonOutput) void {
 }
 
 fn uploadDiscovery(allocator: std.mem.Allocator, discovery: JsonOutput) !void {
-    // 1. Setup TLS Bundle and Client
+    // 1. Serialize discovery data to a buffer
+    var body_payload: std.Io.Writer.Allocating = .init(allocator);
+    defer body_payload.deinit();
+    try body_payload.writer.print("{f}", .{std.json.fmt(discovery, .{})});
+    const json_bytes = body_payload.written();
+
+    // 2. Setup TLS Bundle and Client
     var bundle = std.crypto.Certificate.Bundle{};
-    defer bundle.deinit();
+    defer bundle.deinit(allocator);
     try bundle.rescan(allocator);
 
     var client = http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    // 2. Serialize discovery data to a buffer
-    var body_payload = std.ArrayList(u8).init(allocator);
-    defer body_payload.deinit();
-    try std.json.stringify(discovery, .{}, body_payload.writer());
+    // 3. Setup response capture
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
 
-    // 3. Prepare the Request
-    const uri = try std.Uri.parse("https://api.motherapp.com/v1/discovery");
-    var server_header_buffer: [16 * 1024]u8 = undefined;
-
-    var req = try client.open(.POST, uri, .{
-        .server_header_buffer = &server_header_buffer,
-        .ca_bundle = bundle,
+    // 4. Execute Fetch
+    const result = try client.fetch(.{
+        .method = .POST,
+        .location = .{ .url = "https://api.motherapp.com/v1/discovery" },
+        .payload = json_bytes,
+        .response_writer = &response_body.writer,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .connection = .{ .override = "close" },
+        },
     });
-    defer req.deinit();
 
-    // 4. Headers
-    req.transfer_encoding = .{ .content_length = body_payload.items.len };
-    try req.headers.append("content-type", "application/json");
-    try req.headers.append("connection", "close");
-
-    // 5. Send
-    try req.send();
-    try req.writeAll(body_payload.items);
-    try req.finish();
-
-    // 6. Wait for response
-    try req.wait();
-    if (req.response.status != .ok) {
-        std.debug.print("Discovery upload failed: {d}\n", .{req.response.status});
+    // 5. Handle Response
+    if (result.status != .ok) {
+        std.debug.print("Discovery upload failed: {d}\n", .{result.status});
         return error.UploadFailed;
     }
 

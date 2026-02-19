@@ -8,7 +8,9 @@ const KeyStorage = struct {
     const priv_key_file = "id_ed25519";
 
     fn getStoragePath(allocator: std.mem.Allocator) ![]u8 {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch "/tmp";
+        const home_owned = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+        defer if (home_owned) |h| allocator.free(h);
+        const home = home_owned orelse "/tmp";
         return std.fs.path.join(allocator, &.{ home, dir_name });
     }
 };
@@ -26,12 +28,14 @@ pub fn provisionRobot(allocator: std.mem.Allocator, token: []const u8) !void {
 
     // 2. Prepare Storage
     const path = try KeyStorage.getStoragePath(allocator);
+    defer allocator.free(path);
     std.fs.makeDirAbsolute(path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    const dir = try std.fs.openDirAbsolute(path, .{});
+    var dir = try std.fs.openDirAbsolute(path, .{});
+    defer dir.close();
 
     // 3. Save Private Key (Restrict permissions: 600)
     const priv_file = try dir.createFile(KeyStorage.priv_key_file, .{ .mode = 0o600 });
@@ -43,7 +47,7 @@ pub fn provisionRobot(allocator: std.mem.Allocator, token: []const u8) !void {
     try pub_file.writeAll(&kp.public_key.bytes);
     pub_file.close();
 
-    std.debug.print("Keys generated and stored in {f}\n", .{path});
+    std.debug.print("Keys generated and stored in {s}\n", .{path});
 
     // 5. Send Public Key to MotherApp (Stubbed)
     try uploadPublicKey(allocator, token, kp.public_key.bytes);
@@ -52,7 +56,7 @@ pub fn provisionRobot(allocator: std.mem.Allocator, token: []const u8) !void {
 fn uploadPublicKey(allocator: std.mem.Allocator, token: []const u8, pub_key: [32]u8) !void {
     // 1. Hex encode the public key
     var pub_hex: [64]u8 = undefined;
-    _ = try std.fmt.bufPrint(&pub_hex, "{f}", .{std.fmt.bytesToHex(&pub_key, std.fmt.Case.upper)});
+    _ = try std.fmt.bufPrint(&pub_hex, "{s}", .{std.fmt.bytesToHex(&pub_key, std.fmt.Case.upper)});
 
     // 2. Prepare the JSON body using your implementation
     const payload = ProvisionPayload{
@@ -100,25 +104,46 @@ fn uploadPublicKey(allocator: std.mem.Allocator, token: []const u8, pub_key: [32
     }
 
     // Access the response via the unmanaged list's slice
-    std.debug.print("Successfully provisioned: {f}\n", .{body});
+    std.debug.print("Successfully provisioned: {s}\n", .{body.written()});
 }
 
-fn signData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+pub fn getPublicKeyHex(allocator: std.mem.Allocator) ![]u8 {
     const path = try KeyStorage.getStoragePath(allocator);
-    const dir = try std.fs.openDirAbsolute(path, .{});
+    defer allocator.free(path);
+    var dir = try std.fs.openDirAbsolute(path, .{});
+    defer dir.close();
+
+    const pub_file = try dir.openFile(KeyStorage.pub_key_file, .{});
+    defer pub_file.close();
+
+    var pub_key_bytes: [crypto.sign.Ed25519.PublicKey.encoded_length]u8 = undefined;
+    _ = try pub_file.readAll(&pub_key_bytes);
+
+    const hex = std.fmt.bytesToHex(&pub_key_bytes, .lower);
+    return try allocator.dupe(u8, &hex);
+}
+
+pub fn signData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    const path = try KeyStorage.getStoragePath(allocator);
+    defer allocator.free(path);
+    var dir = try std.fs.openDirAbsolute(path, .{});
+    defer dir.close();
 
     // 1. Read the private key
     const priv_key_file = try dir.openFile(KeyStorage.priv_key_file, .{});
     defer priv_key_file.close();
 
-    var secret_key_bytes: [crypto.sign.Ed25519.secret_length]u8 = undefined;
+    var secret_key_bytes: [crypto.sign.Ed25519.SecretKey.encoded_length]u8 = undefined;
     _ = try priv_key_file.readAll(&secret_key_bytes);
 
-    const key_pair = try crypto.sign.Ed25519.KeyPair.fromSecretKey(secret_key_bytes);
+    const secret_key = try crypto.sign.Ed25519.SecretKey.fromBytes(secret_key_bytes);
+    const key_pair = try crypto.sign.Ed25519.KeyPair.fromSecretKey(secret_key);
 
     // 2. Create the signature
-    const sig = try crypto.sign.Ed25519.sign(data, key_pair, null);
+    const sig = try key_pair.sign(data, null);
 
     // 3. Return as hex string
-    return try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&sig)});
+    const sig_bytes = sig.toBytes();
+    const hex = std.fmt.bytesToHex(&sig_bytes, .lower);
+    return try allocator.dupe(u8, &hex);
 }
