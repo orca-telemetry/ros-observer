@@ -43,7 +43,7 @@ pub fn provisionRobot(allocator: std.mem.Allocator, token: []const u8) !void {
     try pub_file.writeAll(&kp.public_key.bytes);
     pub_file.close();
 
-    std.debug.print("Keys generated and stored in {s}\n", .{path});
+    std.debug.print("Keys generated and stored in {f}\n", .{path});
 
     // 5. Send Public Key to MotherApp (Stubbed)
     try uploadPublicKey(allocator, token, kp.public_key.bytes);
@@ -52,7 +52,7 @@ pub fn provisionRobot(allocator: std.mem.Allocator, token: []const u8) !void {
 fn uploadPublicKey(allocator: std.mem.Allocator, token: []const u8, pub_key: [32]u8) !void {
     // 1. Hex encode the public key
     var pub_hex: [64]u8 = undefined;
-    _ = try std.fmt.bufPrint(&pub_hex, "{s}", .{std.fmt.bytesToHex(&pub_key, std.fmt.Case.upper)});
+    _ = try std.fmt.bufPrint(&pub_hex, "{f}", .{std.fmt.bytesToHex(&pub_key, std.fmt.Case.upper)});
 
     // 2. Prepare the JSON body using your implementation
     const payload = ProvisionPayload{
@@ -100,7 +100,7 @@ fn uploadPublicKey(allocator: std.mem.Allocator, token: []const u8, pub_key: [32
     }
 
     // Access the response via the unmanaged list's slice
-    std.debug.print("Successfully provisioned: {s}\n", .{body});
+    std.debug.print("Successfully provisioned: {f}\n", .{body});
 }
 
 fn signData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
