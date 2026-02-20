@@ -3,7 +3,7 @@ const crypto = std.crypto;
 const http = std.http;
 const constants = @import("constants.zig");
 
-const KeyStorage = struct {
+pub const KeyStorage = struct {
     const dir_name = ".orca";
     const pub_key_file = "id_ed25519.pub";
     const priv_key_file = "id_ed25519";
@@ -14,6 +14,47 @@ const KeyStorage = struct {
         defer if (home_owned) |h| allocator.free(h);
         const home = home_owned orelse "/tmp";
         return std.fs.path.join(allocator, &.{ home, dir_name });
+    }
+
+    pub fn getRobotId(allocator: std.mem.Allocator) ![]u8 {
+        const storage_path = try getStoragePath(allocator);
+        defer allocator.free(storage_path);
+        var dir = try std.fs.openDirAbsolute(storage_path, .{});
+        defer dir.close();
+
+        const file = try dir.openFile(robot_id_file, .{});
+        defer file.close();
+
+        var buf: [36]u8 = undefined;
+        const size = try file.readAll(&buf);
+        return allocator.dupe(u8, buf[0..size]);
+    }
+
+    pub fn signPayload(allocator: std.mem.Allocator, message: []const u8) ![64]u8 { // Note: Ed25519 signature is 64 bytes
+        const storage_path = try getStoragePath(allocator);
+        defer allocator.free(storage_path);
+
+        var dir = try std.fs.openDirAbsolute(storage_path, .{});
+        defer dir.close();
+
+        // 1. Ed25519 SecretKey is 64 bytes. If stored as HEX, the file is 128 bytes.
+        var hex_buffer: [crypto.sign.Ed25519.SecretKey.encoded_length * 2]u8 = undefined;
+        const file = try dir.openFile(priv_key_file, .{});
+        defer file.close();
+
+        const amt = try file.readAll(&hex_buffer);
+        if (amt < hex_buffer.len) return error.InvalidKeyLength;
+
+        // 2. Decode the Hex string into actual bytes
+        var secret_key_bytes: [crypto.sign.Ed25519.SecretKey.encoded_length]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&secret_key_bytes, &hex_buffer);
+
+        // 3. Now this will work!
+        const secretKey = try crypto.sign.Ed25519.SecretKey.fromBytes(secret_key_bytes);
+        const keypair = try crypto.sign.Ed25519.KeyPair.fromSecretKey(secretKey);
+
+        const sig = try keypair.sign(message, null);
+        return sig.toBytes();
     }
 };
 
@@ -78,8 +119,7 @@ fn uploadPublicKey(allocator: std.mem.Allocator, dir: std.fs.Dir, token: []const
     const json_bytes = string.written();
 
     // 3. Sign the JSON body and base64 encode the signature
-    const sig = try key_pair.sign(json_bytes, null);
-    const sig_bytes = sig.toBytes();
+    const sig_bytes = try KeyStorage.signPayload(allocator, json_bytes);
     var sig_b64: [base64_encoder.calcSize(64)]u8 = undefined;
     _ = base64_encoder.encode(&sig_b64, &sig_bytes);
 
@@ -141,31 +181,4 @@ pub fn getPublicKeyHex(allocator: std.mem.Allocator) ![]u8 {
     _ = try pub_file.readAll(&hex_buf);
 
     return try allocator.dupe(u8, &hex_buf);
-}
-
-pub fn signData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    const path = try KeyStorage.getStoragePath(allocator);
-    defer allocator.free(path);
-    var dir = try std.fs.openDirAbsolute(path, .{});
-    defer dir.close();
-
-    // 1. Read the private key (stored as hex)
-    const priv_key_file = try dir.openFile(KeyStorage.priv_key_file, .{});
-    defer priv_key_file.close();
-
-    var hex_buf: [crypto.sign.Ed25519.SecretKey.encoded_length * 2]u8 = undefined;
-    _ = try priv_key_file.readAll(&hex_buf);
-
-    var secret_key_bytes: [crypto.sign.Ed25519.SecretKey.encoded_length]u8 = undefined;
-    _ = std.fmt.hexToBytes(&secret_key_bytes, &hex_buf) catch return error.InvalidKeyFormat;
-    const secret_key = try crypto.sign.Ed25519.SecretKey.fromBytes(secret_key_bytes);
-    const key_pair = try crypto.sign.Ed25519.KeyPair.fromSecretKey(secret_key);
-
-    // 2. Create the signature
-    const sig = try key_pair.sign(data, null);
-
-    // 3. Return as hex string
-    const sig_bytes = sig.toBytes();
-    const hex = std.fmt.bytesToHex(&sig_bytes, .lower);
-    return try allocator.dupe(u8, &hex);
 }

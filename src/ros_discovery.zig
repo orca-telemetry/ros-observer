@@ -1,15 +1,16 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const keys = @import("keys.zig");
+const constants = @import("constants.zig");
 const http = std.http;
+const crypto = std.crypto;
 
 const JsonOutput = struct {
+    robotId: []u8 = "", //  expect it to be filled in later
     topics: []TopicInfo,
     nodes: []NodeInfo,
     services: []ServiceInfo,
     rmw_implementation: []const u8,
-    public_key: []const u8 = "",
-    signature: []const u8 = "",
 
     const TopicInfo = struct {
         name: []const u8,
@@ -57,20 +58,13 @@ pub fn runDiscovery(allocator: std.mem.Allocator, node: *c.rcl_node_t) !void {
     defer sign_target.deinit();
     try sign_target.writer.print("{f}", .{std.json.fmt(discovery_data, .{})});
 
-    // 3. Sign the bytes
-    const signature_hex = try keys.signData(allocator, sign_target.written());
-    defer allocator.free(signature_hex);
+    // add in robot id
+    const robotId = try keys.KeyStorage.getRobotId(allocator);
+    defer allocator.free(robotId);
+    discovery_data.robotId = robotId;
 
-    // 4. Get Public Key Hex for identification
-    const pub_key = try keys.getPublicKeyHex(allocator); // Helper to read from file
-    defer allocator.free(pub_key);
-
-    // 5. Finalize the struct with Auth metadata
-    discovery_data.signature = signature_hex;
-    discovery_data.public_key = pub_key;
-
-    // 6. Push to MotherApp
-    try uploadDiscovery(allocator, discovery_data);
+    // 6. Push to orca cloud
+    try uploadDiscovery(allocator, discovery_data, robotId);
 
     // Optional: Also save a local copy for debugging
     const file = try std.fs.cwd().createFile("last_discovery_sent.json", .{});
@@ -373,12 +367,19 @@ fn freeJsonOutput(allocator: std.mem.Allocator, output: JsonOutput) void {
     allocator.free(output.services);
 }
 
-fn uploadDiscovery(allocator: std.mem.Allocator, discovery: JsonOutput) !void {
+fn uploadDiscovery(allocator: std.mem.Allocator, discovery: JsonOutput, robotId: []u8) !void {
+    const base64_encoder = std.base64.standard.Encoder;
+
     // 1. Serialize discovery data to a buffer
     var body_payload: std.Io.Writer.Allocating = .init(allocator);
     defer body_payload.deinit();
     try body_payload.writer.print("{f}", .{std.json.fmt(discovery, .{})});
     const json_bytes = body_payload.written();
+
+    // sign it
+    const sig_bytes = try keys.KeyStorage.signPayload(allocator, json_bytes);
+    var sig_b64: [base64_encoder.calcSize(64)]u8 = undefined;
+    _ = base64_encoder.encode(&sig_b64, &sig_bytes);
 
     // 2. Setup HTTP Client
     var client = http.Client{ .allocator = allocator };
@@ -389,14 +390,19 @@ fn uploadDiscovery(allocator: std.mem.Allocator, discovery: JsonOutput) !void {
     defer response_body.deinit();
 
     // 4. Execute Fetch
+    const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ constants.discovery_base_url, robotId });
+    defer allocator.free(url);
     const result = try client.fetch(.{
         .method = .POST,
-        .location = .{ .url = "https://api.motherapp.com/v1/discovery" },
+        .location = .{ .url = url },
         .payload = json_bytes,
         .response_writer = &response_body.writer,
         .headers = .{
             .content_type = .{ .override = "application/json" },
             .connection = .{ .override = "close" },
+        },
+        .extra_headers = &.{
+            .{ .name = "X-Signature", .value = &sig_b64 },
         },
     });
 

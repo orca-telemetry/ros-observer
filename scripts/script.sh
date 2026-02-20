@@ -43,4 +43,6 @@ if [[ ! -s "$TARGET_PATH" ]]; then
     echo "Error: Binary is empty or missing at $TARGET_PATH" >&2
     exit 1
 fi
-exec "$TARGET_PATH" "$@"
+exec "$TARGET_PATH" provision --token "$@"
+
+# now run the "discover" endpoint
