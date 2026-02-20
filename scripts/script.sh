@@ -37,12 +37,18 @@ if [[ ! -f "$TARGET_PATH" ]]; then
     chmod +x "$TARGET_PATH"
 fi
 
-# 3. Run the binary
-# We pass all script arguments ($@) directly to the Zig binary
-if [[ ! -s "$TARGET_PATH" ]]; then
-    echo "Error: Binary is empty or missing at $TARGET_PATH" >&2
+# 3. Run the "provision" step
+echo "Starting provision step..."
+if ! "$TARGET_PATH" provision --token "$@"; then
+    echo "Error: Provisioning failed with exit code $?" >&2
     exit 1
 fi
-exec "$TARGET_PATH" provision --token "$@"
 
-# now run the "discover" endpoint
+# 4. Run the "discovery" step
+echo "Starting discovery step..."
+if ! "$TARGET_PATH" discover; then
+    echo "Error: Discovery failed with exit code $?" >&2
+    exit 1
+fi
+
+echo "Robot onboarded with Orca."
