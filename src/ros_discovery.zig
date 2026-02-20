@@ -380,11 +380,7 @@ fn uploadDiscovery(allocator: std.mem.Allocator, discovery: JsonOutput) !void {
     try body_payload.writer.print("{f}", .{std.json.fmt(discovery, .{})});
     const json_bytes = body_payload.written();
 
-    // 2. Setup TLS Bundle and Client
-    var bundle = std.crypto.Certificate.Bundle{};
-    defer bundle.deinit(allocator);
-    try bundle.rescan(allocator);
-
+    // 2. Setup HTTP Client
     var client = http.Client{ .allocator = allocator };
     defer client.deinit();
 

@@ -1,11 +1,13 @@
 const std = @import("std");
 const crypto = std.crypto;
 const http = std.http;
+const constants = @import("constants.zig");
 
 const KeyStorage = struct {
     const dir_name = ".orca";
     const pub_key_file = "id_ed25519.pub";
     const priv_key_file = "id_ed25519";
+    const robot_id_file = "robot_id";
 
     fn getStoragePath(allocator: std.mem.Allocator) ![]u8 {
         const home_owned = std.process.getEnvVarOwned(allocator, "HOME") catch null;
@@ -16,8 +18,7 @@ const KeyStorage = struct {
 };
 
 const ProvisionPayload = struct {
-    token: []const u8,
-    public_key: []const u8,
+    publicKey: []const u8,
 };
 
 pub fn provisionRobot(allocator: std.mem.Allocator, token: []const u8) !void {
@@ -37,63 +38,71 @@ pub fn provisionRobot(allocator: std.mem.Allocator, token: []const u8) !void {
     var dir = try std.fs.openDirAbsolute(path, .{});
     defer dir.close();
 
-    // 3. Save Private Key (Restrict permissions: 600)
+    // 3. Save Private Key as hex (Restrict permissions: 600)
+    const priv_hex = std.fmt.bytesToHex(&kp.secret_key.bytes, .lower);
     const priv_file = try dir.createFile(KeyStorage.priv_key_file, .{ .mode = 0o600 });
-    try priv_file.writeAll(&kp.secret_key.bytes);
+    try priv_file.writeAll(&priv_hex);
     priv_file.close();
 
-    // 4. Save Public Key
+    // 4. Save Public Key as hex
+    const pub_hex = std.fmt.bytesToHex(&kp.public_key.bytes, .lower);
     const pub_file = try dir.createFile(KeyStorage.pub_key_file, .{});
-    try pub_file.writeAll(&kp.public_key.bytes);
+    try pub_file.writeAll(&pub_hex);
     pub_file.close();
 
     std.debug.print("Keys generated and stored in {s}\n", .{path});
 
-    // 5. Send Public Key to MotherApp (Stubbed)
-    try uploadPublicKey(allocator, token, kp.public_key.bytes);
+    // 5. Send Public Key to MotherApp
+    try uploadPublicKey(allocator, dir, token, kp);
 }
 
-fn uploadPublicKey(allocator: std.mem.Allocator, token: []const u8, pub_key: [32]u8) !void {
-    // 1. Hex encode the public key
-    var pub_hex: [64]u8 = undefined;
-    _ = try std.fmt.bufPrint(&pub_hex, "{s}", .{std.fmt.bytesToHex(&pub_key, std.fmt.Case.upper)});
+const ProvisionResponse = struct {
+    robotId: []const u8,
+};
 
-    // 2. Prepare the JSON body using your implementation
+fn uploadPublicKey(allocator: std.mem.Allocator, dir: std.fs.Dir, token: []const u8, key_pair: crypto.sign.Ed25519.KeyPair) !void {
+    const base64_encoder = std.base64.standard.Encoder;
+
+    // 1. Base64 encode the public key
+    var pub_b64: [base64_encoder.calcSize(32)]u8 = undefined;
+    _ = base64_encoder.encode(&pub_b64, &key_pair.public_key.bytes);
+
+    // 2. Prepare the JSON body
     const payload = ProvisionPayload{
-        .token = token,
-        .public_key = &pub_hex,
+        .publicKey = &pub_b64,
     };
 
-    var string: std.io.Writer.Allocating = .init(allocator);
+    var string: std.Io.Writer.Allocating = .init(allocator);
     defer string.deinit();
     try string.writer.print("{f}", .{std.json.fmt(payload, .{})});
     const json_bytes = string.written();
 
-    // 3. Setup TLS Bundle
-    var bundle = std.crypto.Certificate.Bundle{};
-    defer bundle.deinit(allocator);
-    try bundle.rescan(allocator);
+    // 3. Sign the JSON body and base64 encode the signature
+    const sig = try key_pair.sign(json_bytes, null);
+    const sig_bytes = sig.toBytes();
+    var sig_b64: [base64_encoder.calcSize(64)]u8 = undefined;
+    _ = base64_encoder.encode(&sig_b64, &sig_bytes);
 
-    var client = http.Client{
-        .allocator = allocator,
-    };
+    // 4. Setup HTTP Client
+    var client = http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    // 4. Setup response capture
-    // Using the ResponseStorage struct from your FetchOptions
-    var body = std.Io.Writer.Allocating.init(allocator);
+    var body: std.Io.Writer.Allocating = .init(allocator);
     defer body.deinit();
 
     // 5. Execute Fetch
-    // The fetch call handles the payload transmission and headers internally
+    const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ constants.provision_base_url, token });
+    defer allocator.free(url);
     const result = try client.fetch(.{
         .method = .POST,
-        .location = .{ .url = "https://api.motherapp.com/v1/provision" },
+        .location = .{ .url = url },
         .payload = json_bytes,
         .response_writer = &body.writer,
         .headers = .{
             .content_type = .{ .override = "application/json" },
-            .connection = .{ .override = "close" },
+        },
+        .extra_headers = &.{
+            .{ .name = "X-Signature", .value = &sig_b64 },
         },
     });
 
@@ -103,8 +112,19 @@ fn uploadPublicKey(allocator: std.mem.Allocator, token: []const u8, pub_key: [32
         return error.UploadFailed;
     }
 
-    // Access the response via the unmanaged list's slice
-    std.debug.print("Successfully provisioned: {s}\n", .{body.written()});
+    // 7. Parse robot ID from response and save to disk
+    const response_data = body.written();
+    const parsed = std.json.parseFromSlice(ProvisionResponse, allocator, response_data, .{ .ignore_unknown_fields = true }) catch {
+        std.debug.print("Failed to parse provision response: {s}\n", .{response_data});
+        return error.InvalidResponse;
+    };
+    defer parsed.deinit();
+
+    const robot_id_file = try dir.createFile(KeyStorage.robot_id_file, .{});
+    defer robot_id_file.close();
+    try robot_id_file.writeAll(parsed.value.robotId);
+
+    std.debug.print("Successfully provisioned robot: {s}\n", .{parsed.value.robotId});
 }
 
 pub fn getPublicKeyHex(allocator: std.mem.Allocator) ![]u8 {
@@ -116,11 +136,11 @@ pub fn getPublicKeyHex(allocator: std.mem.Allocator) ![]u8 {
     const pub_file = try dir.openFile(KeyStorage.pub_key_file, .{});
     defer pub_file.close();
 
-    var pub_key_bytes: [crypto.sign.Ed25519.PublicKey.encoded_length]u8 = undefined;
-    _ = try pub_file.readAll(&pub_key_bytes);
+    // File is already stored as hex
+    var hex_buf: [crypto.sign.Ed25519.PublicKey.encoded_length * 2]u8 = undefined;
+    _ = try pub_file.readAll(&hex_buf);
 
-    const hex = std.fmt.bytesToHex(&pub_key_bytes, .lower);
-    return try allocator.dupe(u8, &hex);
+    return try allocator.dupe(u8, &hex_buf);
 }
 
 pub fn signData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
@@ -129,13 +149,15 @@ pub fn signData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     var dir = try std.fs.openDirAbsolute(path, .{});
     defer dir.close();
 
-    // 1. Read the private key
+    // 1. Read the private key (stored as hex)
     const priv_key_file = try dir.openFile(KeyStorage.priv_key_file, .{});
     defer priv_key_file.close();
 
-    var secret_key_bytes: [crypto.sign.Ed25519.SecretKey.encoded_length]u8 = undefined;
-    _ = try priv_key_file.readAll(&secret_key_bytes);
+    var hex_buf: [crypto.sign.Ed25519.SecretKey.encoded_length * 2]u8 = undefined;
+    _ = try priv_key_file.readAll(&hex_buf);
 
+    var secret_key_bytes: [crypto.sign.Ed25519.SecretKey.encoded_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&secret_key_bytes, &hex_buf) catch return error.InvalidKeyFormat;
     const secret_key = try crypto.sign.Ed25519.SecretKey.fromBytes(secret_key_bytes);
     const key_pair = try crypto.sign.Ed25519.KeyPair.fromSecretKey(secret_key);
 
