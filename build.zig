@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // strip all debug symbols (Crucial for size)
-    exe.root_module.strip = false;
+    exe.root_module.strip = true;
 
     // dead Code Elimination (Linker Garbage Collection)
     // This removes functions that are never called.
